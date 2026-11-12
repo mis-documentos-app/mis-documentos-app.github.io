@@ -1,6 +1,6 @@
 // Mis Documentos — service worker: guarda sólo la app (HTML, íconos) para que funcione sin internet.
 // Nunca toca tus documentos: esos viven cifrados en IndexedDB.
-const CACHE = 'mis-documentos-v1.0.0';
+const CACHE = 'mis-documentos-v1.1.0';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icons/apple-touch-icon.png', './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png'];
 
 self.addEventListener('install', e => {
