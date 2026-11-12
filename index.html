@@ -288,6 +288,27 @@ svg.i{fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke
 #cover{position:fixed;inset:0;z-index:200;background:var(--bg);display:none;place-items:center}
 body.covered #cover{display:grid}
 #cover .lock-icon{margin:0}
+
+/* ---------- Scanner ---------- */
+.scanner{position:fixed;inset:0;z-index:85;background:#000;color:#fff;display:flex;flex-direction:column;animation:fadein .2s;touch-action:none}
+.sc-top{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:calc(var(--sat) + 10px) 16px 10px}
+.sc-top > :first-child{justify-self:start} .sc-top > :last-child{justify-self:end}
+.sc-top .tbtn{color:#fff;background:rgba(60,60,64,.6);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);border:.5px solid rgba(255,255,255,.14)}
+.sc-top .tbtn.bold{background:var(--tint);border-color:transparent}
+.sc-title{font-size:17px;font-weight:600;text-align:center}
+.sc-hint{text-align:center;font-size:13px;color:rgba(255,255,255,.6);margin:-2px 0 6px;min-height:17px}
+.sc-stage{flex:1;position:relative;margin:6px 22px;min-height:0}
+.sc-stage canvas.sc-img{position:absolute;display:block}
+.sc-stage svg{position:absolute;overflow:visible}
+.sc-stage polygon{fill:rgba(10,132,255,.16);stroke:#0A84FF;stroke-width:2.5;stroke-linejoin:round}
+.sc-stage .h-vis{fill:#fff;stroke:#0A84FF;stroke-width:3}
+.sc-stage .h-hit{fill:transparent;cursor:grab}
+.sc-loupe{position:absolute;width:118px;height:118px;border-radius:50%;border:3px solid #fff;box-shadow:0 8px 24px rgba(0,0,0,.5);pointer-events:none;display:none;overflow:hidden;background:#000}
+.sc-loupe::after{content:"";position:absolute;left:50%;top:50%;width:14px;height:14px;margin:-7px 0 0 -7px;border:2px solid #0A84FF;border-radius:50%}
+.sc-bar{display:flex;justify-content:space-around;margin:10px 16px calc(var(--sab) + 14px);border-radius:30px;padding:6px;background:rgba(44,44,48,.6);-webkit-backdrop-filter:blur(26px) saturate(180%);backdrop-filter:blur(26px) saturate(180%);border:.5px solid rgba(255,255,255,.14)}
+.sc-bar button{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 2px;border-radius:24px;font-size:11px;font-weight:600;color:#fff}
+.sc-bar button.on{color:#0A84FF;background:rgba(255,255,255,.08)}
+.sc-busy{position:absolute;inset:0;display:grid;place-items:center;background:rgba(0,0,0,.55);font-size:15px;font-weight:600;z-index:3}
 </style>
 </head>
 <body>
@@ -297,7 +318,7 @@ body.covered #cover{display:grid}
 <div id="cover"><div class="lock-icon"><svg class="i" width="30" height="30" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div></div>
 <script>
 'use strict';
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 
 /* ================= Helpers ================= */
 const $ = (s, r = document) => r.querySelector(s);
@@ -910,7 +931,14 @@ async function addFiles(sh, files){
   try {
     for(const file of files){
       if(file.size > 25e6){ toast('Archivo demasiado grande (máx. 25 MB)'); continue; }
-      const blob = await compress(file);
+      let blob;
+      if(file.type.startsWith('image/') && file.type !== 'image/gif'){
+        add?.classList.remove('busy');
+        blob = await Scan.open(file);
+        if(!blob) continue;
+        add?.classList.add('busy');
+        if(blob === file) blob = await compress(file);
+      } else blob = file;
       const id = await putFile(blob);
       sh._new.push(id);
       const n = sh._draft.photos.length;
@@ -1157,6 +1185,318 @@ async function viewFile(fid){
     start = null;
   });
 }
+
+/* ================= Document scanner =================
+   Detects the document edges on-device, lets you fine-tune the 4 corners,
+   straightens the perspective and boosts contrast. No libraries, nothing leaves the phone. */
+const Scan = {
+  async load(file){
+    let src;
+    try { src = await createImageBitmap(file); }
+    catch { src = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = URL.createObjectURL(file); }); }
+    const max = 2400, k = Math.min(1, max / Math.max(src.width, src.height));
+    const c = document.createElement('canvas'); c.width = Math.round(src.width * k); c.height = Math.round(src.height * k);
+    c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+    return c;
+  },
+  otsu(hist, total){
+    let sum = 0; for(let i = 0; i < 256; i++) sum += i * hist[i];
+    let sB = 0, wB = 0, best = 0, t = 0;
+    for(let i = 0; i < 256; i++){
+      wB += hist[i]; if(!wB) continue; const wF = total - wB; if(!wF) break;
+      sB += i * hist[i]; const mB = sB / wB, mF = (sum - sB) / wF, v = wB * wF * (mB - mF) ** 2;
+      if(v > best){ best = v; t = i; }
+    }
+    return t;
+  },
+  blur(a, w, h){ // 3x3 box blur, twice
+    let s = a, o = new Float32Array(w * h);
+    for(let p = 0; p < 2; p++){
+      for(let y = 0; y < h; y++) for(let x = 0; x < w; x++){
+        let acc = 0, n = 0;
+        for(let dy = -1; dy <= 1; dy++){ const yy = y + dy; if(yy < 0 || yy >= h) continue; for(let dx = -1; dx <= 1; dx++){ const xx = x + dx; if(xx < 0 || xx >= w) continue; acc += s[yy * w + xx]; n++; } }
+        o[y * w + x] = acc / n;
+      }
+      [s, o] = [o, new Float32Array(w * h)];
+    }
+    return s;
+  },
+  morph(m, w, h, grow){ // dilate (grow=true) or erode, 3x3
+    const o = new Uint8Array(w * h);
+    for(let y = 0; y < h; y++) for(let x = 0; x < w; x++){
+      let v = grow ? 0 : 1;
+      for(let dy = -1; dy <= 1 && (grow ? !v : v); dy++){ const yy = y + dy; for(let dx = -1; dx <= 1; dx++){ const xx = x + dx;
+        const q = (yy < 0 || yy >= h || xx < 0 || xx >= w) ? 0 : m[yy * w + xx];
+        if(grow && q){ v = 1; break; } if(!grow && !q){ v = 0; break; } } }
+      o[y * w + x] = v;
+    }
+    return o;
+  },
+  hull(pts){
+    pts = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lo = [], up = [];
+    for(const p of pts){ while(lo.length >= 2 && cr(lo.at(-2), lo.at(-1), p) <= 0) lo.pop(); lo.push(p); }
+    for(const p of pts.reverse()){ while(up.length >= 2 && cr(up.at(-2), up.at(-1), p) <= 0) up.pop(); up.push(p); }
+    return lo.slice(0, -1).concat(up.slice(0, -1));
+  },
+  area(q){ let a = 0; for(let i = 0; i < q.length; i++){ const p = q[i], n = q[(i + 1) % q.length]; a += p[0] * n[1] - n[0] * p[1]; } return Math.abs(a) / 2; },
+  bestQuad(h){
+    // reduce hull to <= 28 points by dropping the vertex that removes the least area
+    h = h.slice();
+    while(h.length > 28){
+      let mi = 0, ma = Infinity;
+      for(let i = 0; i < h.length; i++){ const a = h[(i - 1 + h.length) % h.length], b = h[i], c = h[(i + 1) % h.length]; const t = Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])); if(t < ma){ ma = t; mi = i; } }
+      h.splice(mi, 1);
+    }
+    const n = h.length; if(n < 4) return null;
+    let best = null, ba = 0;
+    for(let a = 0; a < n; a++) for(let b = a + 1; b < n; b++) for(let c = b + 1; c < n; c++) for(let d = c + 1; d < n; d++){
+      const q = [h[a], h[b], h[c], h[d]], ar = this.area(q); if(ar > ba){ ba = ar; best = q; }
+    }
+    return best;
+  },
+  order(q){
+    const cx = q.reduce((s, p) => s + p[0], 0) / 4, cy = q.reduce((s, p) => s + p[1], 0) / 4;
+    q = q.slice().sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
+    let s = 0; for(let i = 1; i < 4; i++) if(q[i][0] + q[i][1] < q[s][0] + q[s][1]) s = i;
+    return q.slice(s).concat(q.slice(0, s)); // tl, tr, br, bl
+  },
+  detect(canvas){
+    const W0 = canvas.width, H0 = canvas.height, k = Math.min(1, 320 / Math.max(W0, H0));
+    const w = Math.max(8, Math.round(W0 * k)), h = Math.max(8, Math.round(H0 * k));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const x = c.getContext('2d', {willReadFrequently:true}); x.drawImage(canvas, 0, 0, w, h);
+    const d = x.getImageData(0, 0, w, h).data, N = w * h;
+    // background = median colour of a thin border band
+    const band = Math.max(2, Math.round(Math.min(w, h) * .03)), rs = [], gs = [], bs = [];
+    for(let y = 0; y < h; y++) for(let xx = 0; xx < w; xx++){
+      if(y >= band && y < h - band && xx >= band && xx < w - band) continue;
+      const i = (y * w + xx) * 4; rs.push(d[i]); gs.push(d[i + 1]); bs.push(d[i + 2]);
+    }
+    const med = a => { a.sort((p, q) => p - q); return a[a.length >> 1]; };
+    const br = med(rs), bg = med(gs), bb = med(bs);
+    const cands = [];
+    // two cues: colour distance from background, and brightness (documents are usually lighter or darker)
+    const dist = new Float32Array(N), lum = new Float32Array(N);
+    for(let i = 0; i < N; i++){ const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2]; dist[i] = Math.hypot(r - br, g - bg, b - bb); lum[i] = .299 * r + .587 * g + .114 * b; }
+    const bgL = .299 * br + .587 * bg + .114 * bb;
+    const fromMask = m => {
+      m = this.morph(this.morph(m, w, h, false), w, h, true); // open: remove thin noise
+      m = this.morph(this.morph(m, w, h, true), w, h, false); // close: fill small gaps
+      const lab = new Int32Array(N), stack = new Int32Array(N); let best = 0, bestId = 0, id = 0;
+      for(let s0 = 0; s0 < N; s0++){
+        if(!m[s0] || lab[s0]) continue; id++; let sp = 0, cnt = 0; stack[sp++] = s0; lab[s0] = id;
+        while(sp){ const p = stack[--sp]; cnt++; const px = p % w, py = (p / w) | 0;
+          if(px > 0 && m[p - 1] && !lab[p - 1]){ lab[p - 1] = id; stack[sp++] = p - 1; }
+          if(px < w - 1 && m[p + 1] && !lab[p + 1]){ lab[p + 1] = id; stack[sp++] = p + 1; }
+          if(py > 0 && m[p - w] && !lab[p - w]){ lab[p - w] = id; stack[sp++] = p - w; }
+          if(py < h - 1 && m[p + w] && !lab[p + w]){ lab[p + w] = id; stack[sp++] = p + w; } }
+        if(cnt > best){ best = cnt; bestId = id; }
+      }
+      if(best < N * .08) return;
+      const pts = [];
+      for(let p = 0; p < N; p++){ if(lab[p] !== bestId) continue; const px = p % w, py = (p / w) | 0;
+        if(px === 0 || py === 0 || px === w - 1 || py === h - 1 || lab[p - 1] !== bestId || lab[p + 1] !== bestId || lab[p - w] !== bestId || lab[p + w] !== bestId) pts.push([px + .5, py + .5]); }
+      const hl = this.hull(pts); const q = this.bestQuad(hl); if(!q) return;
+      const qa = this.area(q), ha = this.area(hl);
+      if(qa < N * .1 || qa > N * .97) return;
+      cands.push({q, score: (qa / ha) * Math.min(1, best / qa), fill: qa / N});
+    };
+    const D = this.blur(dist, w, h), Lb = this.blur(lum, w, h);
+    let mx = 0; for(let i = 0; i < N; i++) if(D[i] > mx) mx = D[i];
+    const ths = [];
+    if(mx > 12){
+      const hist = new Uint32Array(256), sc = 255 / mx;
+      for(let i = 0; i < N; i++) hist[Math.min(255, (D[i] * sc) | 0)]++;
+      ths.push(this.otsu(hist, N) / sc);
+    }
+    for(const t of [10, 16, 24, 36, 52]) if(t < mx) ths.push(t);
+    for(const t of ths){ const m = new Uint8Array(N); for(let i = 0; i < N; i++) m[i] = D[i] > t ? 1 : 0; fromMask(m); }
+    for(const t of [8, 14, 24]){
+      const up = new Uint8Array(N), dn = new Uint8Array(N);
+      for(let i = 0; i < N; i++){ up[i] = Lb[i] - bgL > t ? 1 : 0; dn[i] = bgL - Lb[i] > t ? 1 : 0; }
+      fromMask(up); fromMask(dn);
+    }
+    // third cue: strong edges (for a light document on a light table)
+    if(!cands.some(c => c.score >= .85)){
+      const L = this.blur(lum, w, h), g = new Float32Array(N); let mx = 0;
+      for(let y = 1; y < h - 1; y++) for(let xx = 1; xx < w - 1; xx++){
+        const i = y * w + xx;
+        const gx = L[i - w + 1] + 2 * L[i + 1] + L[i + w + 1] - L[i - w - 1] - 2 * L[i - 1] - L[i + w - 1];
+        const gy = L[i + w - 1] + 2 * L[i + w] + L[i + w + 1] - L[i - w - 1] - 2 * L[i - w] - L[i - w + 1];
+        g[i] = Math.hypot(gx, gy); if(g[i] > mx) mx = g[i];
+      }
+      if(mx > 10){
+        const hist = new Uint32Array(256), sc = 255 / mx;
+        for(let i = 0; i < N; i++) hist[Math.min(255, (g[i] * sc) | 0)]++;
+        const t = this.otsu(hist, N);
+        let m = new Uint8Array(N); for(let i = 0; i < N; i++) m[i] = (g[i] * sc) > t ? 1 : 0;
+        m = this.morph(m, w, h, true);
+        // fill the region enclosed by edges: flood the background from the border, the rest is the document
+        const out = new Uint8Array(N), st = new Int32Array(N); let sp = 0;
+        for(let xx = 0; xx < w; xx++){ for(const yy of [0, h - 1]){ const i = yy * w + xx; if(!m[i] && !out[i]){ out[i] = 1; st[sp++] = i; } } }
+        for(let yy = 0; yy < h; yy++){ for(const xx of [0, w - 1]){ const i = yy * w + xx; if(!m[i] && !out[i]){ out[i] = 1; st[sp++] = i; } } }
+        while(sp){ const p = st[--sp], px = p % w, py = (p / w) | 0;
+          for(const q2 of [px > 0 ? p - 1 : -1, px < w - 1 ? p + 1 : -1, py > 0 ? p - w : -1, py < h - 1 ? p + w : -1]) if(q2 >= 0 && !m[q2] && !out[q2]){ out[q2] = 1; st[sp++] = q2; } }
+        let fm = new Uint8Array(N); for(let i = 0; i < N; i++) fm[i] = out[i] ? 0 : 1;
+        fm = this.morph(this.morph(fm, w, h, false), w, h, false);
+        const pts = []; let cnt = 0;
+        for(let p = 0; p < N; p++){ if(!fm[p]) continue; cnt++; const px = p % w, py = (p / w) | 0; if(!fm[p - 1] || !fm[p + 1] || !fm[p - w] || !fm[p + w]) pts.push([px + .5, py + .5]); }
+        if(cnt > N * .08 && pts.length > 4){
+          const hl = this.hull(pts), q = this.bestQuad(hl);
+          if(q){ const qa = this.area(q), ha = this.area(hl); if(qa > N * .1 && qa < N * .97) cands.push({q, score:(qa / ha) * Math.min(1, cnt / qa) * .98, fill: qa / N}); }
+        }
+      }
+    }
+    if(!cands.length) return null;
+    cands.sort((a, b) => b.score - a.score);
+    if(cands[0].score < .8) return null;
+    return this.order(cands[0].q.map(([px, py]) => [px / k, py / k]));
+  },
+  homography(src, dst){ // maps dst -> src
+    const A = [], B = [];
+    for(let i = 0; i < 4; i++){
+      const [x, y] = dst[i], [u, v] = src[i];
+      A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); B.push(u);
+      A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); B.push(v);
+    }
+    for(let i = 0; i < 8; i++){
+      let p = i; for(let r = i + 1; r < 8; r++) if(Math.abs(A[r][i]) > Math.abs(A[p][i])) p = r;
+      [A[i], A[p]] = [A[p], A[i]]; [B[i], B[p]] = [B[p], B[i]];
+      for(let r = 0; r < 8; r++){ if(r === i) continue; const f = A[r][i] / A[i][i]; for(let c = i; c < 8; c++) A[r][c] -= f * A[i][c]; B[r] -= f * B[i]; }
+    }
+    return B.map((b, i) => b / A[i][i]);
+  },
+  warp(canvas, q, enhance){
+    const L = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+    let ow = Math.max(L(q[0], q[1]), L(q[3], q[2])), oh = Math.max(L(q[0], q[3]), L(q[1], q[2]));
+    const ID1 = 85.6 / 53.98, r = ow / oh, rr = r >= 1 ? r : 1 / r;
+    if(Math.abs(rr - ID1) / ID1 < .1){ if(r >= 1) oh = ow / ID1; else ow = oh / ID1; } // snap to ID-card shape
+    const s = Math.min(1, 2000 / Math.max(ow, oh)); ow = Math.round(ow * s); oh = Math.round(oh * s);
+    const H = this.homography(q, [[0, 0], [ow - 1, 0], [ow - 1, oh - 1], [0, oh - 1]]);
+    const sw = canvas.width, sh = canvas.height;
+    const sd = canvas.getContext('2d', {willReadFrequently:true}).getImageData(0, 0, sw, sh).data;
+    const out = new ImageData(ow, oh), od = out.data;
+    for(let y = 0; y < oh; y++){
+      for(let x = 0; x < ow; x++){
+        const z = H[6] * x + H[7] * y + 1, u = (H[0] * x + H[1] * y + H[2]) / z, v = (H[3] * x + H[4] * y + H[5]) / z;
+        const x0 = Math.max(0, Math.min(sw - 2, u | 0)), y0 = Math.max(0, Math.min(sh - 2, v | 0));
+        const fx = Math.max(0, Math.min(1, u - x0)), fy = Math.max(0, Math.min(1, v - y0));
+        const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4, o = (y * ow + x) * 4;
+        for(let ch = 0; ch < 3; ch++){
+          od[o + ch] = (sd[i00 + ch] * (1 - fx) + sd[i10 + ch] * fx) * (1 - fy) + (sd[i01 + ch] * (1 - fx) + sd[i11 + ch] * fx) * fy;
+        }
+        od[o + 3] = 255;
+      }
+    }
+    if(enhance) this.enhance(od);
+    const c = document.createElement('canvas'); c.width = ow; c.height = oh; c.getContext('2d').putImageData(out, 0, 0);
+    return c;
+  },
+  enhance(d){
+    const hist = new Uint32Array(256), n = d.length / 4;
+    for(let i = 0; i < d.length; i += 4) hist[(.299 * d[i] + .587 * d[i + 1] + .114 * d[i + 2]) | 0]++;
+    let lo = 0, hi = 255, acc = 0;
+    for(let i = 0; i < 256; i++){ acc += hist[i]; if(acc > n * .01){ lo = i; break; } }
+    acc = 0; for(let i = 255; i >= 0; i--){ acc += hist[i]; if(acc > n * .01){ hi = i; break; } }
+    if(hi - lo < 30) return;
+    const lut = new Uint8ClampedArray(256);
+    for(let i = 0; i < 256; i++) lut[i] = Math.round(Math.pow(Math.max(0, Math.min(1, (i - lo) / (hi - lo))), .92) * 255);
+    for(let i = 0; i < d.length; i += 4){ d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+  },
+  rotate(canvas, q){
+    const c = document.createElement('canvas'); c.width = canvas.height; c.height = canvas.width;
+    const x = c.getContext('2d'); x.translate(c.width, 0); x.rotate(Math.PI / 2); x.drawImage(canvas, 0, 0);
+    const H = canvas.height;
+    return [c, q ? this.order(q.map(([px, py]) => [H - py, px])) : null];
+  },
+  defaultQuad(c){ const mx = c.width * .08, my = c.height * .08; return [[mx, my], [c.width - mx, my], [c.width - mx, c.height - my], [mx, c.height - my]]; },
+
+  /* UI: returns a Blob, or null if cancelled */
+  open(file){
+    return new Promise(async resolve => {
+      const el = document.createElement('div'); el.className = 'scanner';
+      el.innerHTML = `<div class="sc-top"><button class="tbtn" data-s="cancel">Cancelar</button><div class="sc-title">Escanear</div><button class="tbtn bold" data-s="ok">Listo</button></div>
+        <div class="sc-hint">Detectando el documento…</div>
+        <div class="sc-stage"><canvas class="sc-img"></canvas><svg><polygon/>${[0,1,2,3].map(i => `<circle class="h-vis" r="11" data-h="${i}"/><circle class="h-hit" r="30" data-h="${i}"/>`).join('')}</svg><div class="sc-loupe"><canvas width="118" height="118"></canvas></div></div>
+        <div class="sc-bar">
+          <button data-s="auto">${ico('search', 22)}Detectar</button>
+          <button data-s="full">${ico('wallet', 22)}Foto entera</button>
+          <button data-s="rot"><svg class="i" width="22" height="22" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>Rotar</button>
+          <button data-s="enh">${ico('eye', 22)}Mejorar</button>
+        </div>`;
+      document.body.append(el);
+      const stage = $('.sc-stage', el), cv = $('canvas.sc-img', el), svg = $('svg', el), poly = $('polygon', el), hint = $('.sc-hint', el);
+      const loupe = $('.sc-loupe', el), lctx = $('canvas', loupe).getContext('2d');
+      let src, q, enh = localStorage.getItem('scanEnhance') !== '0', scale = 1, ox = 0, oy = 0;
+      const setEnh = () => $('[data-s=enh]', el).classList.toggle('on', enh);
+      setEnh();
+      const layout = () => {
+        const r = stage.getBoundingClientRect();
+        scale = Math.min(r.width / src.width, r.height / src.height);
+        const w = src.width * scale, h = src.height * scale; ox = (r.width - w) / 2; oy = (r.height - h) / 2;
+        Object.assign(cv.style, {left: ox + 'px', top: oy + 'px', width: w + 'px', height: h + 'px'});
+        Object.assign(svg.style, {left: ox + 'px', top: oy + 'px', width: w + 'px', height: h + 'px'});
+        svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+        draw();
+      };
+      const draw = () => {
+        poly.setAttribute('points', q.map(p => `${p[0] * scale},${p[1] * scale}`).join(' '));
+        $$('circle', svg).forEach(c => { const p = q[+c.dataset.h]; c.setAttribute('cx', p[0] * scale); c.setAttribute('cy', p[1] * scale); });
+      };
+      const setSrc = c => { src = c; cv.width = c.width; cv.height = c.height; cv.getContext('2d').drawImage(c, 0, 0); };
+      const busy = msg => { const b = document.createElement('div'); b.className = 'sc-busy'; b.textContent = msg; stage.append(b); return () => b.remove(); };
+      const finish = v => { removeEventListener('resize', layout); el.remove(); resolve(v); };
+      const autodetect = async () => {
+        const done = busy('Detectando…'); await sleep(30);
+        let r = null; try { r = Scan.detect(src); } catch(e){ console.warn(e); }
+        done();
+        if(r){ q = r; hint.textContent = 'Si hace falta, mové las esquinas'; }
+        else { q = Scan.defaultQuad(src); hint.textContent = 'No lo encontré: mové las esquinas a los bordes'; }
+        draw();
+      };
+      try { setSrc(await Scan.load(file)); }
+      catch { el.remove(); resolve(file); return; }
+      q = Scan.defaultQuad(src); layout(); addEventListener('resize', layout);
+      await autodetect();
+
+      // dragging
+      let drag = -1;
+      const toImg = e => { const r = svg.getBoundingClientRect(); return [Math.max(0, Math.min(src.width, (e.clientX - r.left) / scale)), Math.max(0, Math.min(src.height, (e.clientY - r.top) / scale))]; };
+      const showLoupe = p => {
+        const z = 2.6, s = 118 / z;
+        lctx.fillStyle = '#000'; lctx.fillRect(0, 0, 118, 118);
+        const k = 1 / scale; // canvas px per screen px
+        lctx.drawImage(src, p[0] - s * k / 2, p[1] - s * k / 2, s * k, s * k, 0, 0, 118, 118);
+        let lx = ox + p[0] * scale - 59, ly = oy + p[1] * scale - 59 - 95;
+        if(ly < -40) ly = oy + p[1] * scale + 40;
+        Object.assign(loupe.style, {display:'block', left: lx + 'px', top: ly + 'px'});
+      };
+      svg.addEventListener('pointerdown', e => { const h = e.target.dataset.h; if(h === undefined) return; drag = +h; svg.setPointerCapture(e.pointerId); showLoupe(q[drag]); e.preventDefault(); });
+      svg.addEventListener('pointermove', e => { if(drag < 0) return; q[drag] = toImg(e); draw(); showLoupe(q[drag]); });
+      const end = () => { if(drag < 0) return; drag = -1; loupe.style.display = 'none'; };
+      svg.addEventListener('pointerup', end); svg.addEventListener('pointercancel', end);
+
+      el.addEventListener('click', async e => {
+        const s = e.target.closest('[data-s]')?.dataset.s; if(!s) return;
+        if(s === 'cancel') finish(null);
+        if(s === 'auto') autodetect();
+        if(s === 'full'){ q = [[0, 0], [src.width, 0], [src.width, src.height], [0, src.height]]; hint.textContent = 'Se guarda la foto completa'; draw(); }
+        if(s === 'rot'){ [src, q] = Scan.rotate(src, q); setSrc(src); layout(); }
+        if(s === 'enh'){ enh = !enh; localStorage.setItem('scanEnhance', enh ? '1' : '0'); setEnh(); hint.textContent = enh ? 'Mejora de contraste activada' : 'Colores originales'; }
+        if(s === 'ok'){
+          const done = busy('Procesando…'); await sleep(30);
+          try {
+            const out = Scan.warp(src, Scan.order(q), enh);
+            const blob = await new Promise(r => out.toBlob(r, 'image/jpeg', .88));
+            done(); finish(blob);
+          } catch(err){ done(); console.warn(err); toast('No se pudo procesar la foto'); }
+        }
+      });
+    });
+  }
+};
 
 /* ================= Events ================= */
 document.addEventListener('click', async e => {
